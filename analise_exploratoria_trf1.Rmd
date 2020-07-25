@@ -1,0 +1,257 @@
+---
+title: "Análise exploratória - Jeovan"
+author: "GVF"
+date: "12/07/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
+                      fig.retina = 4, dev = 'svg', fig.align = 'center')
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(knitr)
+library(kableExtra)
+library(ggwordcloud)
+library(showtext)
+library(patchwork)
+
+showtext_auto()
+font_add("charter", "C:/Users/GUILHERME/AppData/Local/Microsoft/Windows/Fonts/Charter Regular.otf")
+
+retirar <- rio::import("processos_retirar.xlsx") %>% 
+  mutate(processo = as.double(processo))
+
+trf1 <- rio::import("julgados_trf1.csv", encoding = "UTF-8") %>% 
+  mutate(processo = as.double(processo)) %>% 
+  # retirar a ANA
+  filter(!str_detect(parte, "AGENCIA NACIONAL DE AGUAS")) %>% 
+  distinct(processo, .keep_all = TRUE) %>% 
+  anti_join(retirar)
+
+rm(retirar)
+# trf3 <- rio::import("julgados-trf3.csv", encoding = "UTF-8")
+
+```
+
+<style type="text/css">
+
+body {
+
+  font-family: Charter;
+
+}
+
+</style>
+
+# TRF-1
+
+Vou pegar o identificador (processo) e o julgado, que é o texto mais importante e que precisa ser limpo.
+
+## Análise por palavras soltas - GERAL
+
+Uma primeira opção de análise é por palavras simples. Isso permite alguns produtos:
+- estatísticas de palavras mais frequentes;
+- criação de gráficos de nuvem de palavras;
+- modelagem estatística de tópicos.
+
+```{r}
+remover_br <- tibble(word = stopwords("pt"))
+remover_letras <- tibble(word = letters)
+remover_outros <- tibble(word = c("nº", "art", "assim", "ser", "rel", "fls", "nao", "federal", "lei", "apelacao",
+                                  "relator", "administrativo", "turma", "nacional", "agencia", "sentenca", "provimento",
+                                  "processo", "transporte", "poder", "desembargador", "apelante", "tribunal", "apelado",
+                                  "ha", "sobre", "ja", "pode", "qualquer", "ementa", "recurso", "df", "pedido", "autor",
+                                  "juiz", "termos", "advogado", "acao", "autora", "sentido", "sob", "sao", "ltda", "dj",
+                                  "jose", "impetrante", "auto", "autos", "mandado", "3a", "rs", "ac"))
+substituir <- c("energiaeletrica"     = "energia eletrica",
+                "vigilanciasanitaria" = "vigilancia sanitaria",
+                "servicos"            = "servico",
+                "publica"             = "publico",
+                "10.438"              = "lei 10.438",
+                "9.847"               = "lei 9.847",
+                "8.884"               = "lei 8.884",
+                "10.233"              = "lei 10.233",
+                "9.478"               = "lei 9.478",
+                "9.656"               = "lei 9.656",
+                "9.961"               = "lei 9.961",
+                "9.472"               = "lei 9.472")
+
+texto_trf1 <- trf1 %>% 
+  select(processo, julgado) %>% 
+  # Jeovan pediu para deixar junto
+  mutate(julgado = str_replace_all(julgado, 
+                                   regex("energia el(é|e)trica", ignore_case = TRUE), 
+                                   "energiaeletrica"),
+         julgado = str_replace_all(julgado, 
+                                   regex("vigil(â|a)ncia sanit(á|a)ria", ignore_case = TRUE), 
+                                   "vigilanciasanitaria"),
+         julgado = str_remove_all(julgado,
+                                  regex("mandado de seguran(ç|c)a", ignore_case = TRUE))) %>% 
+  # quebra o julgado por palavra
+  unnest_tokens(word, julgado) %>% 
+  # tira os acentos e caracteres especiais
+  mutate(word = stringi::stri_trans_general(word, "latin-ascii"),
+         # substitui algumas palavras
+         word = str_replace_all(word, substituir)) %>% 
+  # tira as palavras comuns
+  anti_join(remover_br) %>% 
+  # tira as letras soltas
+  anti_join(remover_letras) %>% 
+  # tira outras palavras não relevantes
+  anti_join(remover_outros) %>% 
+  # mantém apenas texto
+  filter(str_detect(word, "\\D"), 
+         # exclui os ordinais 
+         !str_detect(word, "\\d(ª|º)"),
+         # exclui numerais romanos
+         !str_detect(word, "^[mdclxvi]+$"))
+
+palavras_trf1 <- texto_trf1 %>% 
+  count(word, sort = TRUE)
+```
+
+As 30 palavras simples mais frequentes:
+```{r}
+palavras_trf1 %>% 
+  head(30) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Nuvem de palavras (50 palavras mais comuns) - opção 1:
+```{r graf-geral1}
+g <- palavras_trf1 %>% 
+  head(50) %>% 
+  ggplot(aes(label = word, size = n, color = n)) +
+  geom_text_wordcloud(area_corr = TRUE, family = "charter") +
+  scale_size_area(max_size = 16) +
+  theme_minimal(base_family = "charter") +
+  scale_color_viridis_c() +
+  labs(title = "Aqui podemos botar um título bacana.",
+       subtitle = "E descritivo, se você quiser.")
+
+p <-  data.frame(categoria = c("1", "1", "1", "1", "1", "1", "1"),
+           n = c(1, 2, 3, 4, 5, 6, 7)) %>% 
+  ggplot() + 
+  geom_tile(aes(x = categoria, y = n, fill = n, width = 0.35)) +
+  theme_void(base_family = "charter") +
+  scale_fill_viridis_c() +
+  coord_flip() +
+  theme(legend.position = "none") + 
+  labs(caption = "Fonte: internetz\nElaboração própria")
+
+g / p +
+  plot_layout(heights = c(10,1))
+```
+
+Opção 2:
+```{r graf-geral2}
+g <- palavras_trf1 %>% 
+  head(50) %>% 
+  ggplot(aes(label = word, size = n, color = n)) +
+  geom_text_wordcloud(area_corr = TRUE, family = "charter") +
+  scale_size_area(max_size = 16) +
+  theme_minimal() +
+  scale_color_viridis_c(option = "inferno", direction = -1)
+
+p <-  data.frame(categoria = c("1", "1", "1", "1", "1", "1", "1"),
+           n = c(1, 2, 3, 4, 5, 6, 7)) %>% 
+  ggplot() + 
+  geom_tile(aes(x = categoria, y = n, fill = n, width = 0.35)) +
+  theme_void() +
+  scale_fill_viridis_c(option = "inferno", direction = -1) +
+  coord_flip() +
+  theme(legend.position = "none")
+
+g / p +
+  plot_layout(heights = c(10,1))
+```
+
+## Análise por palavras soltas - PARTE
+
+Utilizando a base de palavras, vou pegar a variável de PARTE e ver as estatísticas com base nessa variável.
+
+```{r}
+texto_trf1_parte <- texto_trf1 %>% 
+  left_join(trf1 %>% select(processo, parte) %>% distinct())
+
+# texto_trf1_parte %>% count(parte) %>% View()
+```
+
+Primeiro preciso arrumar a variável, formatá-la para ter apenas as siglas das agências.
+
+```{r}
+texto_trf1_parte <- texto_trf1_parte %>% 
+  mutate(parte_sigla = case_when(
+    
+    str_detect(parte, "\\s+ANAC") ~ "ANAC",
+    str_detect(parte, "\\s+ANEEL") ~ "ANEEL",
+    str_detect(parte, "\\s+ANP") ~ "ANP",
+    str_detect(parte, "\\s+ANS") ~ "ANS",
+    str_detect(parte, "\\s+ANATEL") ~ "ANATEL",
+    str_detect(parte, "\\s+ANTT") ~ "ANTT",
+    str_detect(parte, "\\s+ANVISA") ~ "ANVISA",
+    str_detect(parte, "\\s+CVM") ~ "CVM",
+    str_detect(parte, "\\s+CADE") ~ "CADE",
+    str_detect(parte, "\\s+ANTAQ") ~ "ANTAQ",
+    str_detect(parte, "AGENCIA NACIONAL DE ENERGIA ELETRICA") ~ "ANEEL",
+    str_detect(parte, "AGENCIA NACIONAL DE TELECOMUNICACOES") ~ "ANATEL",
+    str_detect(parte, "AGENCIA NACIONAL DE TRANSPORTES TERRESTRES") ~ "ANTT",
+    TRUE ~ NA_character_
+    
+    )) %>% 
+  # retiro os casos em que a sigla é igual à palavra
+  filter(!str_to_lower(parte_sigla) == word)
+
+# verifica o resultado
+# texto_trf1_parte %>% count(parte, parte_sigla) %>% View()
+```
+
+Tabelas de cada uma das classes (restringi às 15 primeiras palavras:
+
+```{r results='asis'}
+palavras_trf1_parte <- texto_trf1_parte %>% 
+  count(parte_sigla, word, sort = TRUE) %>% 
+  group_split(parte_sigla)
+
+palavras_trf1_parte %>% walk(. %>% head(15) %>% kable() %>% kable_styling(full_width = FALSE) %>% print())
+```
+
+Nuvem de palavras de cada uma das partes (30 palavras mais comuns) - aqui é importante frisar que a cor está relacionada ao número de observações geral, por isso algumas agências ficaram apenas com cor mais roxa (têm menos palavras - menor participação). Lembrando que a escala de cor é uma sugestão, você que vai escolher, inclusive se quer usar ou não. Além disso, tem também os ajustes de título, subtítulo, nota, fonte, etc.
+
+```{r graf-parte, out.width='100%', fig.height=12, fig.width=12}
+
+g <- texto_trf1_parte %>% 
+  group_by(parte_sigla) %>% 
+  filter(parte_sigla != "ANTAQ") %>% 
+  count(word, sort = TRUE) %>% 
+  # mutate(part = 100 * n / sum(n)) %>% 
+  mutate(part = 100 * n / max(n)) %>% 
+  slice(1:30) %>% 
+  ggplot(aes(label = word, size = part, color = n)) +
+  geom_text_wordcloud(area_corr = TRUE, family = "charter") +
+  # scale_radius(range = c(0,10), limits = c(0, NA)) +
+  scale_size_area(max_size = 8) +
+  facet_wrap(~parte_sigla) +
+  theme_minimal() +
+  scale_color_viridis_c()
+
+p <-  data.frame(categoria = c("1", "1", "1", "1", "1", "1", "1"),
+           n = c(1, 2, 3, 4, 5, 6, 7)) %>% 
+  ggplot() + 
+  geom_tile(aes(x = categoria, y = n, fill = n, width = 0.15)) +
+  theme_void() +
+  scale_fill_viridis_c() +
+  coord_flip() +
+  theme(legend.position = "none")
+
+g / p +
+  plot_layout(heights = c(10,1))
+```
+
+***
+Foram desconsideradas `r nrow(remover_outros)` palavras/termos na análise, que são as seguintes: `r remover_outros %>% deframe() %>%  knitr::combine_words(and = "e ")`.
+
+

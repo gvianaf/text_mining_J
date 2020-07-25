@@ -1,0 +1,1133 @@
+---
+title: "Análise das expressões"
+author: "GVF"
+date: "24/07/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
+                      fig.retina = 4, dev = 'svg', fig.align = 'center')
+
+options(OutDec = ",")
+
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(knitr)
+library(kableExtra)
+library(ggwordcloud)
+library(showtext)
+
+showtext_auto()
+font_add("charter", "C:/Users/GUILHERME/AppData/Local/Microsoft/Windows/Fonts/Charter Regular.otf")
+
+retirar <- rio::import("processos_retirar.xlsx") %>% 
+  mutate(processo = as.double(processo))
+
+trf1 <- rio::import("julgados_trf1.csv", encoding = "UTF-8") %>% 
+  mutate(processo = as.double(processo)) %>% 
+  # retirar a ANA
+  filter(!str_detect(parte, "AGENCIA NACIONAL DE AGUAS")) %>% 
+  distinct(processo, .keep_all = TRUE) %>% 
+  anti_join(retirar)
+
+rm(retirar)
+
+# trf3 <- rio::import("julgados-trf3.csv", encoding = "UTF-8")
+
+```
+
+<style type="text/css">
+
+body {
+
+  font-family: Charter;
+
+}
+
+</style>
+
+# TRF-1
+## Limpeza dos dados
+
+Vou pegar o identificador (processo) e o julgado, que é o texto mais importante e que precisa ser limpo para começarmos a trabalhar. Estou retirando as *stopwords*, que são termos comuns, letras soltas, numerais romanos, símbolos, pontuação, caracteres especiais (ç etc) e demais palavras e termos que retiramos quando da análise exploratória. Além disso o texto precisa estar uniforme, então deixei tudo em minúsculo e retirei os espaços em branco extras.
+
+O processo de limpeza é iterativo: cada vez que realizo um pedaço da análise, como uma tabela, eu verifico todos os termos e vejo se posso retirar mais algum que não agrega valor ao resultado, e executo a análise toda novamente. 
+
+```{r limpeza}
+remover_br <- tibble(word = stopwords("pt")) %>% 
+  # como estamos trabalhando com sentenças
+  # preciso especificar que quero as palavras inteiras dentro da frase
+  # e não pedaços
+  mutate(word = paste0("\\b", word, "\\b")) %>% 
+  deframe() %>% 
+  # a barra serve para separar as possíveis correspondências
+  paste(., collapse = "|")
+remover_letras <- tibble(word = letters) %>% 
+  mutate(word = paste0("\\b", word, "\\b")) %>% 
+  deframe() %>% 
+  paste(., collapse = "|")
+remover_outros <- tibble(word = c("nº", "art", "assim", "ser", "rel", "fls", "federal", "lei", "apelacao",
+                                  "relator", "administrativo", "turma", "nacional", "agencia", "sentenca", "provimento",
+                                  "processo", "transporte", "poder", "desembargador", "apelante", "tribunal", "apelado",
+                                  "ha", "sobre", "ja", "pode", "qualquer", "ementa", "recurso", "df", "pedido", "autor",
+                                  "juiz", "termos", "advogado", "acao", "autora", "sentido", "sob", "sao", "ltda", "dj",
+                                  "jose", "impetrante", "auto", "autos", "mandado", "3a", "ed", "in")) %>% 
+  mutate(word = paste0("\\b", word, "\\b")) %>% 
+  deframe() %>% 
+  paste(., collapse = "|")
+
+trf1_limpo <- trf1 %>% 
+  select(processo, julgado) %>% 
+  mutate(julgado = removePunctuation(julgado),
+         julgado = removeNumbers(julgado),
+         julgado = stringi::stri_trans_general(julgado, "latin-ascii"),
+         julgado = str_to_lower(julgado),
+         julgado = str_remove_all(julgado, remover_br),
+         julgado = str_remove_all(julgado, remover_letras),
+         julgado = str_remove_all(julgado, remover_outros),
+         julgado = str_remove_all(julgado, "\\d(ª|º)"),
+         # retira números romanos
+         julgado = str_remove_all(julgado, "\\b[mdclxvi]+\\b"),
+         # retira símbolos
+         julgado = str_remove_all(julgado, "ª|º|\"|-|§"),
+         julgado = str_squish(julgado))
+```
+
+## Expressões das dimensões reputacionais
+
+Aqui vamos primeiramente validar os termos destacados pelo pesquisador. Novamente, é um processo muito iterativo, não só da minha parte, como programador, mas também do cliente. Como é apenas uma palavra, na maioria dos casos, pode ser mais simples essa identificação.
+
+### Validação da categoria: TÉCNICA
+
+- Competência (da agência)
+
+Se formos muito estritos, exigindo que 'agência' venha depois de 'competência' ou suas variações, só temos um resultado:
+
+```{r exp1a}
+termos <- c("competen\\w+ ag\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Se formos menos específicos, ainda querendo ver a palavra que vem após 'competência', temos muitas ocorrências nos processos (241). A tabela abaixo tem os 50 primeiros termos:
+
+```{r exp1b}
+termos <- c("competen\\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE) %>% 
+  head(50)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+Por fim, se pegarmos apenas o termo e suas variações, temos o seguinte:
+
+```{r exp1b}
+termos <- c("competen\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- confiabilidade
+
+```{r exp2}
+termos <- c("confia\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  filter(!str_detect(value, "passiv(a|o)|nao e suficiente|constitucionalidade|nao vinculados|ministerio publico")) %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- teste
+
+```{r exp3}
+termos <- c("test[aeo]\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos),
+         !str_detect(julgado, "testem")) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- análise
+
+```{r exp4}
+termos <- c("anali\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- avaliacao
+
+```{r exp5}
+termos <- c("avalia\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- cálculo
+
+```{r exp6}
+termos <- c("calcul\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- dados
+
+```{r exp7}
+termos <- c("dado\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- evidências
+
+```{r exp8}
+termos <- c("eviden\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- exame
+
+```{r exp9}
+termos <- c("exam\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- expertise
+
+```{r exp10}
+termos <- c("expert\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- especialização
+
+```{r exp11}
+termos <- c("especiali\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- perícia
+
+```{r exp12}
+termos <- c("peri[tc]\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- pesquisa
+
+```{r exp13}
+termos <- c("pesquis\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- laudo
+
+```{r exp14}
+termos <- c("laud\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- conhecimento
+
+```{r exp15}
+termos <- c("conhecim\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- metodologia
+
+```{r exp16}
+termos <- c("metod\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- modelo
+
+```{r exp17}
+termos <- c("model\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- profissional
+
+Nesse termo peguei também 'proficiência' - uma ocorrência só. Quer que deixe?
+
+```{r exp18}
+termos <- c("profi[^l]\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- quantificado & quantitativo
+
+Juntei esses dois termos, pela semelhança. Posso separar se preferir.
+
+```{r exp19}
+termos <- c("quanti[ft]\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- robusto
+
+```{r exp20}
+termos <- c("robust\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- científico
+
+```{r exp21}
+termos <- c("cienti\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- estudo
+
+```{r exp22}
+termos <- c("estud\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- técnico
+
+```{r exp23}
+termos <- c("tecnic\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- critérios técnicos
+
+```{r exp24}
+termos <- c("crit\\w+ tec\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- pesquisa
+
+```{r exp25}
+termos <- c("raz\\w+ tec\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- qualificação dos agentes
+
+Aqui só um que parece ser o que você quer, e eu fui bem generoso na expressão, para tentar pegar mais resultados.
+
+```{r exp26}
+termos <- c("qualif\\w+.{0,50} agent\\w+",
+            "agent\\w+.{0,50} qualif\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+### Validação da categoria: PERFORMANCE
+
+- exerce
+
+Aqui fiquei na dúvida - mantém 'exercício' e semelhantes?
+
+```{r exp27}
+termos <- c("exerc\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- aprimora
+
+```{r exp28}
+termos <- c("aprim\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- implementa
+
+```{r exp29}
+termos <- c("implement\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- fortalece
+
+Acho que não é o que você quer...
+
+```{r exp30}
+termos <- c("fortal\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- promove
+
+Deixei 'promoção' e similares também.
+
+```{r exp31}
+termos <- c("promo\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- resultado
+
+```{r exp32}
+termos <- c("result\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- alcançado
+
+```{r exp33}
+termos <- c("alcanc\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- decisão adotada
+
+```{r exp34}
+termos <- c("deci\\w+.{0,50} adot\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- cumprimento
+
+```{r exp35}
+termos <- c("cumpri\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- efetividade
+
+```{r exp36}
+termos <- c("efetiv\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- eficiência
+
+Juntei com 'eficácia' também.
+
+```{r exp37}
+termos <- c("efic\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- meta (de qualidade)
+
+No word que você me mandou tem essa 'meta de qualidade' e 'meta' - juntei os dois.
+
+```{r exp38}
+termos <- c("meta\\w+.{0,50} qual\\w+", "metas\\b") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>%
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- objetivo
+
+```{r exp39}
+termos <- c("objeti\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- aperfeiçoamento
+
+```{r exp40}
+termos <- c("aperf\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- inspecionado
+
+```{r exp41}
+termos <- c("inspec\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- indicador de desempenho
+
+Nenhuma ocorrência.
+
+```{r exp42}
+termos <- c("indicad\\w+.{0,25} desemp\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- obrigar
+
+```{r exp43}
+termos <- c("obrig\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- resultado
+
+```{r exp44}
+termos <- c("result\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- performance
+
+Só um resultado...
+
+```{r exp45}
+termos <- c("perfo\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- restringir
+
+```{r exp46}
+termos <- c("restri[cng]\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- sucesso
+
+```{r exp47}
+termos <- c("sucesso\\b",
+            "suced\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+- tempestivo
+
+```{r exp48}
+termos <- c("pesquis\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+
+
