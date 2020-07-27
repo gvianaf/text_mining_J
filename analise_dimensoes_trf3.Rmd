@@ -1,0 +1,408 @@
+---
+title: "Análise das dimensões - TRF3"
+author: "GVF"
+date: "24/07/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
+                      fig.retina = 4, dev = 'svg', fig.align = 'center')
+
+options(OutDec = ",")
+
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(knitr)
+library(kableExtra)
+library(ggwordcloud)
+library(showtext)
+
+showtext_auto()
+font_add("charter", "C:/Users/GUILHERME/AppData/Local/Microsoft/Windows/Fonts/Charter Regular.otf")
+
+trf3 <- rio::import("julgados-trf3.csv", encoding = "UTF-8") %>% 
+  mutate(processo = as.double(processo)) %>% 
+  janitor::get_dupes(processo)
+  # retirar a ANA
+  filter(!str_detect(processo, regex( "AGENCIA NACIONAL DE AGUAS", ignore_case = TRUE))) %>% 
+  distinct(processo, .keep_all = TRUE)
+
+rm(retirar)
+
+# trf3 <- rio::import("julgados-trf3.csv", encoding = "UTF-8")
+
+```
+
+<style type="text/css">
+
+body {
+
+  font-family: Charter;
+
+}
+
+</style>
+
+# TRF-1
+## Limpeza dos dados
+
+Vou pegar o identificador (processo) e o julgado, que é o texto mais importante e que precisa ser limpo para começarmos a trabalhar. Estou retirando as *stopwords*, que são termos comuns, letras soltas, numerais romanos, símbolos, pontuação, caracteres especiais (ç etc) e demais palavras e termos que retiramos quando da análise exploratória. Além disso o texto precisa estar uniforme, então deixei tudo em minúsculo e retirei os espaços em branco extras.
+
+O processo de limpeza é iterativo: cada vez que realizo um pedaço da análise, como uma tabela, eu verifico todos os termos e vejo se posso retirar mais algum que não agrega valor ao resultado, e executo a análise toda novamente. 
+
+```{r limpeza}
+remover_br <- tibble(word = stopwords("pt")) %>% 
+  # como estamos trabalhando com sentenças
+  # preciso especificar que quero as palavras inteiras dentro da frase
+  # e não pedaços
+  mutate(word = paste0("\\b", word, "\\b")) %>% 
+  deframe() %>% 
+  # a barra serve para separar as possíveis correspondências
+  paste(., collapse = "|")
+remover_letras <- tibble(word = letters) %>% 
+  mutate(word = paste0("\\b", word, "\\b")) %>% 
+  deframe() %>% 
+  paste(., collapse = "|")
+remover_outros <- tibble(word = c("nº", "art", "assim", "ser", "rel", "fls", "federal", "lei", "apelacao",
+                                  "relator", "administrativo", "turma", "nacional", "agencia", "sentenca", "provimento",
+                                  "processo", "transporte", "poder", "desembargador", "apelante", "tribunal", "apelado",
+                                  "ha", "sobre", "ja", "pode", "qualquer", "ementa", "recurso", "df", "pedido", "autor",
+                                  "juiz", "termos", "advogado", "acao", "autora", "sentido", "sob", "sao", "ltda", "dj",
+                                  "jose", "impetrante", "auto", "autos", "mandado", "3a", "ed", "in")) %>% 
+  mutate(word = paste0("\\b", word, "\\b")) %>% 
+  deframe() %>% 
+  paste(., collapse = "|")
+
+trf1_limpo <- trf1 %>% 
+  select(processo, julgado) %>% 
+  mutate(julgado = removePunctuation(julgado),
+         julgado = removeNumbers(julgado),
+         julgado = stringi::stri_trans_general(julgado, "latin-ascii"),
+         julgado = str_to_lower(julgado),
+         julgado = str_remove_all(julgado, remover_br),
+         julgado = str_remove_all(julgado, remover_letras),
+         julgado = str_remove_all(julgado, remover_outros),
+         julgado = str_remove_all(julgado, "\\d(ª|º)"),
+         # retira números romanos
+         julgado = str_remove_all(julgado, "\\b[mdclxvi]+\\b"),
+         # retira símbolos
+         julgado = str_remove_all(julgado, "ª|º|\"|-|§"),
+         julgado = str_squish(julgado))
+```
+
+## Expressões dos processos de regulação de interesse da pesquisa
+
+Vamos avaliar uma a uma as expressões - provavelmente elas não estão exatamente como queremos, então teremos que "dar" essa liberdade na programação. No entanto, quanto mais liberdade dermos, mais texto "único" retornará, o que dificultará a normalização dos resultados, então temos que atentar para esse *tradeoff*.
+
+Aqui é, novamente, um processo muito iterativo, não só da minha parte, como programador, mas também do cliente, por isso essa parte será bem trabalhosa.
+
+- presunção de legitimidade
+
+```{r exp1}
+termos <- c("presuncao legitimidade",
+            "presuncao.{0,50} legitimidade", 
+            "pressuposto.{0,50} legit\\w+", 
+            "presum.{0,50} legit\\w+", 
+            "presente caso.{0,50} legit\\w+",
+            "prestacao.{0,25} legit\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido ou alguma variação (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`). A tabela representa quantas vezes as expressões ocorreram em todos esses documentos, então seu número é maior que o número de processos.
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- legitimidade do ato administrativo
+
+```{r exp2}
+termos <- c("legit\\w+ \\w+ ato adm\\w+",
+                "legit\\w+.{0,75} adm\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  filter(!str_detect(value, "passiv(a|o)|nao e suficiente|constitucionalidade|nao vinculados|ministerio publico")) %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- discricionariedade
+
+```{r exp3}
+termos <- c("\\w+ \\w+ discric\\w+ \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+[[Observação: aqui é complicado pegar um trecho, pois você pediu só a palavra, então não há muita variação. Eu pedi para retornar a correspondência e as duas palavras adjacentes (de cada lado). Podemos mudar isso.]]
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- (não cabe) apreciar critérios de oportunidade e conveniência dos atos administrativos
+
+```{r exp4}
+termos <- c("\\w+ \\w+ convenien\\w+.{0,10} oportunid\\w+ \\w+ \\w+",
+            "\\w+ \\w+ oportunid\\w+.{0,10} convenien\\w+ \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- validade a ato administrativo ou a ato punitivo
+
+```{r exp5}
+termos <- c("validade.{0,10} ato adm\\w+",
+                "validade.{0,10} ato puni\\w+",
+                "adm\\w+.{0,25} puni\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- suposta incorreção técnica
+
+```{r exp6}
+termos <- c("\\w+ \\w+ incorrec\\w+ \\w+ \\w+",
+                "\\w+ \\w+ incorret\\w+ \\w+ \\w+",
+                "\\w+ incorre\\w+ tecn\\w+ \\w+",
+                "supos\\w+.{0,25} incorre\\w+",
+                "supos\\w+.{0,25} tecn\\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- poder discricionário da autoridade administrativa
+
+```{r exp7}
+termos <- c("\\w+ \\w+ pod\\w+.{0,10} discric\\w+ \\w+ \\w+",
+            "\\w+ \\w+ autori\\w+.{0,10} adm\\w+ \\w+ \\w+",
+            "\\w+ \\w+ discric\\w+.{0,50} autori\\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- defesa do consumidor
+
+```{r exp8}
+termos <- c("\\w+ \\w+ defe\\w+.{0,25} consum\\w+ \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- não deve regular
+
+```{r exp9}
+termos <- c("nao.{0,50} regular \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- qualidade do serviço
+
+```{r exp10}
+termos <- c("qualidade.{0,50} servico \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- extrapolou ou transbordou (extrapolação) seu poder (regulamentar)
+
+```{r exp11}
+termos <- c("extrapol\\w+.{0,50} regulament\\w+ \\w+ \\w+",
+            "transbord\\w+.{0,50} regulament\\w+ \\w+ \\w+",
+            "extrapol\\w+.{0,50} poder \\w+ \\w+",
+            "transbord\\w+.{0,50} poder \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- pretensão de que o Judiciário se substitua ao
+
+```{r exp12}
+termos <- c("pretens\\w+.{0,100} judicia\\w+ \\w+ \\w+",
+            "judicia\\w+.{0,100} subst\\w+ \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
+
+- não está autorizado a interferir no mérito
+
+```{r exp13}
+termos <- c("nao.{0,50} autoriz\\w+.{0,50} merit\\w+ \\w+ \\w+",
+            "nao.{0,50} interf\\w+.{0,50} \\w+ \\w+") %>% 
+  paste(., collapse = "|")
+
+correspondencias <- trf1_limpo %>% 
+  filter(str_detect(julgado, termos)) %>% 
+  mutate(termo = str_match_all(julgado, termos))
+
+correspondencias$termo %>% 
+  unlist() %>% 
+  enframe() %>% 
+  count(value, sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Do total de `r nrow(trf1_limpo)` processos, `r nrow(correspondencias)` têm o termo escolhido (`r paste0(round(100*nrow(correspondencias)/nrow(trf1_limpo), 2), "%")`).
+
+**Discussão**: a tabela acima mostra os termos que foram encontrados com a expressão escolhida - podemos manter ou devemos refinar o filtro? O número de observações está de acordo com o esperado (literatura, conhecimento empírico, etc)? Talvez inserir novos termos?
