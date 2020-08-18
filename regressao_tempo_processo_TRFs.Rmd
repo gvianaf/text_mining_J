@@ -1,0 +1,1125 @@
+---
+title: "Regressão Linear - TRFs"
+author: "GVF"
+date: "31/07/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
+                      fig.retina = 4, dev = 'svg', fig.align = 'center')
+
+options(OutDec = ",", scipen = 9)
+
+set.seed(4826)
+
+library(tidyverse)
+library(modelsummary)
+library(janitor)
+library(deflateBR)
+library(InformationValue)
+library(car)
+library(broom)
+
+# pega os processos e valores do TRF1
+trf1_valor_causa <- rio::import("trf1_processos_valor_causa.xlsx", col_names = c("processo", "valor_orig"), skip = 1) %>% 
+  drop_na() %>% 
+  mutate(processo = str_remove_all(processo, "-"),
+         processo = str_remove_all(processo, "\\."))
+
+trf1 <- rio::import("trf1.xlsx") %>%
+  distinct(processo, .keep_all = TRUE) %>%
+  clean_names() %>% 
+  filter(!(agencia %in% c("antaq", "ana"))) %>%
+  left_join(trf1_valor_causa) %>% 
+  # deflaciona o valor do processo com base no IPCA
+  mutate(valor_causa = ipca(valor_orig, as.Date(data_julgamento), "06/2020")) %>% 
+  select(tempo_processo, agencia, assunto, decisao, agencia_apelante, tipologia, valor_causa) %>% 
+  mutate(agencia_apelante = ifelse(agencia_apelante == "não",
+                                   "nao",
+                                   "sim"),
+         valor_faixa = case_when(
+           
+           valor_causa <= 500000 ~ "até quinhentos mil",
+           valor_causa > 500000 & valor_causa <= 1000000 ~ "até um milhão",
+           valor_causa > 1000000 ~ "acima de um milhão",
+           TRUE ~ NA_character_
+           
+         ))
+
+rm(trf1_valor_causa)
+rio::export(trf1, "trf1_tempo_processo_limpo.xlsx")
+
+trf3 <- rio::import("base_final_trf3.xlsx") %>% 
+  mutate(processo = as.double(processo)) %>% 
+  distinct(processo, .keep_all = TRUE) %>% 
+  clean_names() %>% 
+  select(tempo_processo, agencia, assunto, decisao, valor_causa, 
+         agencia_apelante = apelante_agencia, tipologia, valor_faixa) %>% 
+  mutate(agencia_apelante = ifelse(agencia_apelante == "nao_agencia",
+                                   "nao",
+                                   "sim"))
+
+rio::export(trf3, "trf3_tempo_processo_limpo.xlsx")
+
+```
+
+<style type="text/css">
+
+body {
+
+  font-family: Charter;
+
+}
+
+</style>
+
+# Modelagem estatística do tempo de processo
+
+Utilizando as bases do TRF3 e TRF1. Retirei os processos duplicados e as ocorrências das agências ANA e ANTAQ.
+
+## Análise exploratória dos dados
+
+Primeiramente vamos verificar a variável de interesse - tempo de processo. Vou juntar as duas bases para facilitar a análise.
+
+```{r}
+trfs <- trf1 %>% 
+  mutate(tribunal = "TRF1") %>% 
+  bind_rows(trf3 %>% mutate(tribunal = "TRF3"))
+
+summary(trfs$tempo_processo)
+```
+
+Tem um tempo negativo, vou assumir que é um erro de sinal apenas.
+
+```{r}
+trfs <- trfs %>% 
+  mutate(tempo_processo = ifelse(tempo_processo < 0,
+                                 -1 * tempo_processo,
+                                 tempo_processo))
+
+summary(trfs$tempo_processo)
+```
+
+Verificando graficamente em um box-plot:
+
+```{r}
+trfs %>% 
+  ggplot(aes(x = tribunal, y = tempo_processo, fill = tribunal)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(x = "Tribunal", y = "Tempo de processo") +
+  theme(legend.position = 'none') +
+  scale_fill_viridis_d(option = "E")
+  
+```
+
+Alguns outliers, especialmente no TRF3. A média de tempo do processo é maior no TRF1.
+
+E o histograma:
+
+```{r}
+trfs %>% 
+  ggplot(aes(x = tempo_processo, fill = tribunal)) +
+  geom_histogram(bins = 30) +
+  facet_grid(~tribunal) +
+  theme_classic() +
+  labs(y = "Frequência", x = "Tempo de processo") +
+  scale_fill_viridis_d(option = "E") +
+  theme(legend.position = "none")
+```
+
+Que mostram que as distribuições são bem diferentes e não se assemelham a uma Normal.
+
+Vericando as demais variáveis que farão parte da modelagem.
+
+- Agência - CADE, CVM e ANAC têm poucas observações. Próxima iteração vamos verificar se vale a pena mantê-las.
+```{r}
+trfs %>% 
+  count(agencia, sort = TRUE) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+- Assunto - tudo OK.
+```{r}
+trfs %>% 
+  count(assunto, sort = TRUE) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+- Decisão - tudo OK.
+```{r}
+trfs %>% 
+  count(decisao, sort = TRUE) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+- Agência é a apelante - tudo OK.
+```{r}
+trfs %>% 
+  count(agencia_apelante, sort = TRUE) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+- Tipologia - pr tem poucas observações. Próxima iteração vamos verificar se vale a pena mantê-la.
+```{r}
+trfs %>% 
+  count(tipologia, sort = TRUE) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+- Valor da causa - problemático, devido a um outlier de R$ 6.760.000.000. Os gráficos ficam deformados por causa dele. 
+```{r}
+summary(trfs$valor_causa)
+
+trfs %>% 
+  ggplot(aes(x = tribunal, y = valor_causa, fill = tribunal)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(x = "Tribunal", y = "Valor da causa") +
+  theme(legend.position = 'none') +
+  scale_fill_viridis_d(option = "E")
+
+trfs %>% 
+  ggplot(aes(x = valor_causa, fill = tribunal)) +
+  geom_histogram(bins = 10) +
+  facet_grid(~tribunal) +
+  theme_classic() +
+  labs(y = "Frequência", x = "Valor da causa") +
+  scale_fill_viridis_d(option = "E") +
+  theme(legend.position = "none")
+```
+
+Vou retirar só esse outlier para verificar como fica. Ainda fica horrível. Melhor usar a faixa de valores mesmo.
+```{r}
+trfs %>% 
+  filter(valor_causa != max(valor_causa, na.rm = TRUE)) %>% 
+  select(valor_causa) %>% 
+  map(~summary(.))
+
+trfs %>% 
+  filter(valor_causa != max(valor_causa, na.rm = TRUE)) %>% 
+  ggplot(aes(x = tribunal, y = valor_causa, fill = tribunal)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(x = "Tribunal", y = "Valor da causa") +
+  theme(legend.position = 'none') +
+  scale_fill_viridis_d(option = "E")
+
+trfs %>% 
+  filter(valor_causa != max(valor_causa, na.rm = TRUE)) %>% 
+  ggplot(aes(x = valor_causa, fill = tribunal)) +
+  geom_histogram(bins = 10) +
+  facet_grid(~tribunal) +
+  theme_classic() +
+  labs(y = "Frequência", x = "Valor da causa") +
+  scale_fill_viridis_d(option = "E") +
+  theme(legend.position = "none")
+```
+
+- Valor da causa por faixa - OK. Tem os NAs do TRF1. Tem um desbalanceamento nas classes, podemos testar opções depois.
+```{r}
+trfs %>% 
+  count(valor_faixa, sort = TRUE) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r}
+rio::export(trfs, "trfs_tempo_processo_limpo.xlsx")
+```
+
+## TRFs
+
+Vou juntar as bases dos TRFs e rodar os modelos, inserindo uma variável de qual TRF os dados provêm e retirando o valor da causa.
+
+Variável dependente: tempo de processo.
+
+Modelos testados:
+- modelo1: agência, assunto, agência apelante, tipologia, tribunal, valor da causa (normalizado) e agencia apelante[sim] x decisão[sim];
+- modelo2: agência, assunto, agência apelante, tipologia, tribunal, faixa de valor da causa e agencia apelante[sim] x decisão[sim];
+- modelo3: todas exceto valor da causa e agencia;
+- modelo4: todas exceto valor da causa e assunto;
+- modelo5: todas exceto valor da causa e tipologia;
+- modelo6: agência apelante, faixa de valor da causa, tribunal e agencia apelante[sim] x decisão[sim].
+
+### Considerando as variáveis de valor da causa
+
+Avaliação: modelos 2 e 5 parecem os melhores. Termo de interação é significativo e positivo (influência do TRF3); tipologia não parece influenciar muito; o tribunal ser o TRF3 influenciou negativamente no tempo do processo, mas é significativo apenas em 2 modelos (4 e 6); as faixas de valor são sempre significativas e positivas; mas estamos usando apenas parte dos dados do TRF1 (225/564).
+
+```{r}
+# trfs <- rio::import("trfs_tempo_processo_limpo.xlsx")
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_completo.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+Acatando as sugestões do VIF, vou retirar algumas variáveis dos modelos, retirando a multicolinearidade dos ajustes.
+
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif.docx")
+```
+
+Verificando se os modelos têm *outliers* que influenciam demais, temos diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers2.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers3.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers4.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers5.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers6.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Feita a remoção dos outliers, vou rodar os modelos novamente.
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers7.docx")
+```
+
+Verificando novamente se os modelos têm *outliers* que influenciam demais, continuamos com diversas observações que estão atrapalhando o ajuste do modelo. A tabela abaixo mostra quantas observações devem ser retiradas, de cada modelo, de forma a melhorar o ajuste. Procedendo a isso.
+
+```{r}
+outliers <- modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3) %>% 
+  ungroup()
+
+outliers %>% 
+  group_by(modelo) %>% 
+  count()
+```
+
+```{r}
+trfs_m1 <- trfs_m1 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A1") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m2 <- trfs_m2 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A2") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m3 <- trfs_m3 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A3") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m4 <- trfs_m4 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A4") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m5 <- trfs_m5 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A5") %>% select(.rownames)) %>% 
+  select(-.rownames)
+
+trfs_m6 <- trfs_m6 %>% 
+  mutate(.rownames = as.character(row_number())) %>% 
+  anti_join(outliers %>% filter(modelo == "Model A6") %>% select(.rownames)) %>% 
+  select(-.rownames)
+```
+
+Após OITO iterações, finalizamos a etapa de retirada de outliers. As amostras finais podem ser vistas na tabela abaixo.
+
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs_m1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m2)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m3)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m4)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m5)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs_m6)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_vif_outliers8.docx")
+```
+
+# Regressão logística
+
+Vou criar a variável de decisão a favor e contra a agência.
+```{r}
+trfs <- trfs %>% 
+  mutate(decisao_agencia = case_when(
+    
+    decisao == "provido" & agencia_apelante == "sim" ~ "a favor",
+    decisao == "provido" & agencia_apelante == "nao" ~ "contra",
+    decisao == "improvido" & agencia_apelante == "nao" ~ "a favor",
+    decisao == "improvido" & agencia_apelante == "sim" ~ "contra"
+    
+  ),
+  decisao_agencia_d = ifelse(decisao_agencia == "a favor",
+                             1,
+                             0))
+
+trfs %>% 
+  count(decisao_agencia) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+
+tab <- trfs %>% 
+  count(agencia, decisao_agencia) %>% 
+  pivot_wider(names_from = decisao_agencia, values_from = n) %>% 
+  adorn_totals(where = c("row", "col")) %>% 
+  mutate(percentual_favor = round(100*`a favor` / Total, 2),
+         percentual_contra = round(100*1 - percentual_favor, 2))
+
+rio::export(tab, "agencia_decisao.xlsx")
+```
+
+Variável dependente: decisão a favor a agência (valor 1) & decisão contra a agência (valor 0).
+
+Modelos testados:
+- modelo1: agência, assunto, agência apelante, tipologia, tribunal, valor da causa (normalizado) e agencia apelante[sim] x decisão[sim];
+- modelo2: agência, assunto, agência apelante, tipologia, tribunal, faixa de valor da causa e agencia apelante[sim] x decisão[sim];
+- modelo3: todas exceto valor da causa e agencia;
+- modelo4: todas exceto valor da causa e assunto;
+- modelo5: todas exceto valor da causa e tipologia;
+- modelo6: agência apelante, faixa de valor da causa, tribunal e agencia apelante[sim] x decisão[sim].
+
+### Considerando as variáveis de valor da causa
+
+Avaliação: o primeiro modelo (A1) teve um ajuste ruim. Nos demais modelos, podemos ver que quando a agência é a ANEEL o coeficiente é negativo e significante, o que significa que, nos processos em que a agência é a ANEEL, a probabilidade da decisão ser a favor é diminuída. O mesmo ocorreu com o assunto NORMAS & PROCESSUAL - coeficiente negativo e significativo. O tempo do processo (normalizado) foi positivo e significativo, ou seja, quanto maior o tempo do processo, maior a probabilidade da decisão ser a favor da agência. O mesmo ocorre quando o tribunal é o TRF3.
+
+```{r}
+
+glance_custom.lm <- function(x) {
+    
+    out <- tibble::tibble(`Pseudo R2` = DescTools::PseudoR2(x, "CoxSnell"))
+    return(out)
+}
+
+modelos <- list()
+modelos[["Model A1"]] <- glm(decisao_agencia_d ~ agencia + assunto + tipologia + tribunal + scale(valor_causa) + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A2"]] <- glm(decisao_agencia_d ~ agencia + assunto + tipologia + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A3"]] <- glm(decisao_agencia_d ~ assunto + tipologia + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A4"]] <- glm(decisao_agencia_d ~ agencia + tipologia + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A5"]] <- glm(decisao_agencia_d ~ agencia + assunto + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A6"]] <- glm(decisao_agencia_d ~ tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/log_trfs_com-valor_completo.docx")
+```
+
+Verificando a multicolinearidade nos modelos, devemos desconsiderar as variáveis que têm VIF > 4. Isso ocorre no modelo A1 e A2 (agência e assunto) e A5 (agencia). Vou fazer esses ajustes e rodar novamente os modelos.
+
+```{r}
+modelos %>% map(vif)
+```
+
+O modelo A1 continua não convergindo corretamente. Imagino que seja devido à variável de valor da causa. O pseudo-R2 caiu, mas não temos mais problemas de multicolinearidade. Os modelos finais ficaram da seguinte forma, conforme tabela abaixo:
+
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- glm(decisao_agencia_d ~ tipologia + tribunal + scale(valor_causa) + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A2"]] <- glm(decisao_agencia_d ~ tipologia + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A3"]] <- glm(decisao_agencia_d ~ assunto + tipologia + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A4"]] <- glm(decisao_agencia_d ~ agencia + tipologia + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A5"]] <- glm(decisao_agencia_d ~ assunto + tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A6"]] <- glm(decisao_agencia_d ~ tribunal + valor_faixa + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/log_trfs_com-valor_completo_vif.docx")
+```
+
+Verificando se os modelos têm *outliers* que influenciam demais, não encontrei nenhum, então tudo certo aqui também.
+
+```{r}
+
+modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3)
+```
+
+
+### Desconsiderando as variáveis de valor da causa
+
+Avaliação: desconsiderando o valor da causa, temos resultados semelhantes:
+- quando a agência é a ANEEL, o coeficiente é negativo e significante;
+- quando o assunto é NORMAS, PROCESSUAL ou SANÇÃO (2 de 3 modelos), o coeficiente é negativo e significante;
+- o tempo do processo (normalizado) influencia positivamente e é estatisticamente significativo;
+- tipologia RR é negativa e significativa em um dos modelos;
+- o tribunal ser o TRF3 influencia positivamente e é estatisticamente significativo;
+
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- glm(decisao_agencia_d ~ agencia + assunto + tipologia + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A3"]] <- glm(decisao_agencia_d ~ assunto + tipologia + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A4"]] <- glm(decisao_agencia_d ~ agencia + tipologia + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A5"]] <- glm(decisao_agencia_d ~ agencia + assunto + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A6"]] <- glm(decisao_agencia_d ~ tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/log_trfs_sem-valor_completo.docx")
+```
+
+Verificando a multicolinearidade nos modelos, devemos desconsiderar as variáveis que têm VIF > 4. Isso ocorre apenas no modelo 1, variável agência. 
+
+```{r}
+modelos %>% map(vif)
+```
+
+Retirei agência do modelo A1 e ele fica igual ao modelo A3 - vou retirar o A1. O pseudo-R2 não parece ter mudado muito e não temos mais problemas de multicolinearidade. Os modelos finais ficaram da seguinte forma, conforme tabela abaixo:
+
+```{r}
+
+modelos <- list()
+
+modelos[["Model A3"]] <- glm(decisao_agencia_d ~ assunto + tipologia + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A4"]] <- glm(decisao_agencia_d ~ agencia + tipologia + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A5"]] <- glm(decisao_agencia_d ~ agencia + assunto + tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+modelos[["Model A6"]] <- glm(decisao_agencia_d ~ tribunal + scale(tempo_processo), family = binomial(link = "logit"), 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/log_trfs_sem-valor_completo_vif.docx")
+```
+
+Verificando se os modelos têm *outliers* que influenciam demais, não encontrei nenhum, então tudo certo aqui também.
+
+```{r}
+
+modelos %>% 
+  map_df(augment, .id = "modelo") %>% 
+  group_by(modelo) %>% 
+  filter(abs(.std.resid) > 3)
+```
+
+
+```{r include=FALSE}
+
+### para depois
+
+# previsoes <- modelos %>% map_dfc(~plogis(predict(., trfs)), .id = "modelo") %>% as_tibble()
+# opt <- InformationValue::optimalCutoff(trfs$decisao_agencia_d, previsoes$`Model A5`)
+
+# summary(modelos[[1]])
+# 
+# plotROC(trfs$decisao_agencia_d, previsoes$`Model A1`)
+# plotROC(trfs$decisao_agencia_d, previsoes$`Model A2`)
+# plotROC(trfs$decisao_agencia_d, previsoes$`Model A3`)
+# plotROC(trfs$decisao_agencia_d, previsoes$`Model A4`)
+# plotROC(trfs$decisao_agencia_d, previsoes$`Model A5`)
+# plotROC(trfs$decisao_agencia_d, previsoes$`Model A6`)
+# 
+# ResourceSelection::hoslem.test(x = trfs$decisao_agencia_d, y = previsoes$`Model A2`, g = 10)
+# 
+# Concordance(trfs$decisao_agencia_d, previsoes$`Model A1`)
+# Concordance(trfs$decisao_agencia_d, previsoes$`Model A2`)
+# Concordance(trfs$decisao_agencia_d, previsoes$`Model A3`)
+# Concordance(trfs$decisao_agencia_d, previsoes$`Model A4`)
+# Concordance(trfs$decisao_agencia_d, previsoes$`Model A5`)
+# Concordance(trfs$decisao_agencia_d, previsoes$`Model A6`)
+# 
+# confusionMatrix(trfs$decisao_agencia_d, previsoes$`Model A1`, threshold = 0.7)
+# 
+# plot(modelos[[2]], which = 4, id.n = 3)
+```
+

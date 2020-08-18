@@ -1,0 +1,510 @@
+---
+title: "Regressão linear"
+author: "GVF"
+date: "29/07/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
+                      fig.retina = 4, dev = 'svg', fig.align = 'center')
+
+options(OutDec = ",", scipen = 9)
+
+set.seed(4826)
+
+library(tidyverse)
+library(modelsummary)
+library(janitor)
+library(deflateBR)
+
+# pega os processos e valores do TRF1
+trf1_valor_causa <- rio::import("trf1_processos_valor_causa.xlsx", col_names = c("processo", "valor_orig"), skip = 1) %>% 
+  drop_na() %>% 
+  mutate(processo = str_remove_all(processo, "-"),
+         processo = str_remove_all(processo, "\\."))
+
+trf1 <- rio::import("trf1.xlsx") %>%
+  distinct(processo, .keep_all = TRUE) %>%
+  clean_names() %>% 
+  filter(!(agencia %in% c("antaq", "ana"))) %>%
+  left_join(trf1_valor_causa) %>% 
+  # deflaciona o valor do processo com base no IPCA
+  mutate(valor_causa = ipca(valor_orig, as.Date(data_julgamento), "06/2020")) %>% 
+  select(tempo_processo, agencia, assunto, decisao, agencia_apelante, tipologia, valor_causa) %>% 
+  mutate(agencia_apelante = ifelse(agencia_apelante == "não",
+                                   "nao",
+                                   "sim"),
+         valor_faixa = case_when(
+           
+           valor_causa <= 500000 ~ "até quinhentos mil",
+           valor_causa > 500000 & valor_causa <= 1000000 ~ "até um milhão",
+           valor_causa > 1000000 ~ "acima de um milhão",
+           TRUE ~ NA_character_
+           
+         ))
+
+rm(trf1_valor_causa)
+rio::export(trf1, "trf1_tempo_processo_limpo.xlsx")
+
+trf3 <- rio::import("base_final_trf3.xlsx") %>% 
+  mutate(processo = as.double(processo)) %>% 
+  distinct(processo, .keep_all = TRUE) %>% 
+  clean_names() %>% 
+  select(tempo_processo, agencia, assunto, decisao, valor_causa, 
+         agencia_apelante = apelante_agencia, tipologia, valor_faixa) %>% 
+  mutate(agencia_apelante = ifelse(agencia_apelante == "nao_agencia",
+                                   "nao",
+                                   "sim"))
+
+rio::export(trf3, "trf3_tempo_processo_limpo.xlsx")
+
+```
+
+<style type="text/css">
+
+body {
+
+  font-family: Charter;
+
+}
+
+</style>
+
+# Modelagem estatística do tempo de processo
+
+Utilizando as bases do TRF3 e TRF1. Retirei os processos duplicados e as ocorrências das agências ANA e ANTAQ.
+
+## [TO-DO] Verificação dos pressupostos estatísticos
+
+Primeiramente vamos verificar a variável de interesse - tempo de processo. Vou juntar as duas bases para facilitar a análise.
+
+```{r}
+trfs <- trf1 %>% 
+  mutate(tribunal = "TRF1") %>% 
+  bind_rows(trf3 %>% mutate(tribunal = "TRF3"))
+
+summary(trfs$tempo_processo)
+```
+
+Tem um tempo negativo, vou assumir que é um erro de sinal apenas.
+
+```{r}
+trfs <- trfs %>% 
+  mutate(tempo_processo = ifelse(tempo_processo < 0,
+                                 -1 * tempo_processo,
+                                 tempo_processo))
+
+summary(trfs$tempo_processo)
+```
+
+Verificando graficamente em um box-plot:
+
+```{r}
+trfs %>% 
+  ggplot(aes(x = tribunal, y = tempo_processo, fill = tribunal)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(x = "Tribunal", y = "Tempo de processo") +
+  theme(legend.position = 'none') +
+  scale_fill_viridis_d(option = "E")
+  
+```
+
+Alguns outliers, especialmente no TRF3. A média de tempo do processo é maior no TRF1.
+
+E o histograma:
+
+```{r}
+trfs %>% 
+  ggplot(aes(x = tempo_processo, fill = tribunal)) +
+  geom_histogram(bins = 30) +
+  facet_grid(~tribunal) +
+  theme_classic() +
+  labs(y = "Frequência", x = "Tempo de processo") +
+  scale_fill_viridis_d(option = "E") +
+  theme(legend.position = "none")
+```
+
+Que mostram que as distribuições são bem diferentes e não se assemelham a uma Normal.
+
+<br>
+
+Uma regressão linear robusta deve seguir alguns pressupostos:
+1. A variável dependente deve ter distribuição próxima à Normal.
+
+Para fazer essa verificação aplicamos os testes de Kolmogorov-Smirnov e Shapiro-Wilk, que têm como hipótese nula H0 que a distribuição da variável è semelhante à Normal.
+```{r}
+ks.test(trfs$tempo_processo, "pnorm")
+shapiro.test(trfs$tempo_processo)
+```
+
+Com p-valores < 0,05, nossa hipótese nula é rejeitada, então não podemos afirmar que o tempo de processo segue uma distribuição normal. Dessa forma, temos que fazer uma transformação na variável. Uma normalização ((valor - média) / desvio-padrão) geralmente resolve. Vamos testar:
+
+```{r}
+trfs <- trfs %>% 
+  mutate(tempo_processo_z = as.double(scale(tempo_processo)))
+
+ks.test(trfs$tempo_processo_z, "pnorm")
+shapiro.test(trfs$tempo_processo_z)
+```
+
+Não funcionou... Vamos tentar LOG.
+
+```{r}
+trfs <- trfs %>% 
+  mutate(tempo_processo_log = log(tempo_processo))
+
+ks.test(trfs$tempo_processo_log, "pnorm")
+shapiro.test(trfs$tempo_processo_log)
+```
+
+Também não. Vamos deixar para depois essa parte...
+
+```{r}
+# sqrt(summary(lm(tempo_processo ~ agencia, data = trfs))[["r.squared"]])
+
+```
+
+## TRF-3
+
+Tabela de frequência das agências:
+
+```{r}
+trfs %>% 
+  filter(tribunal == "TRF3") %>% 
+  count(agencia) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+
+```
+
+Variável dependente: tempo de processo.
+
+Modelos testados:
+- modelo1: agência, assunto, agência apelante, tipologia, valor da causa e agencia apelante[sim] x decisão[sim];
+- modelo2: agência, assunto, agência apelante, tipologia e faixa de valor da causa e agencia apelante[sim] x decisão[sim];
+- modelo3: todas exceto valor da causa e agencia;
+- modelo4: todas exceto valor da causa e assunto;
+- modelo5: todas exceto valor da causa e tipologia;
+- modelo6: agência apelante, faixa de valor da causa e agencia apelante[sim] x decisão[sim].
+
+Explicação da tabela:
+A tabela tem os coeficientes de cada variável e modelo (incluindo o intercepto, que não deve ser "analisado"). Se positivo, aquela variável impacta positivamente no tempo do processo, ou seja, aumenta; se negativa, diminui o tempo do processo. Isso deve ser visto em conjunto com a significância (asteriscos) - só podemos afirmar que determinada variável influi de fato no modelo se for estatisticamente significante (p-valor < 0,05).
+
+Nas variáveis categóricas você vai perceber que seus nomes estão ligados às categorias presentes na variável, mas sempre um nível a menos - agência apelante é sim/não, então só o sim foi considerado. Isso ocorre pois não é possível utilizar todos os níveis de uma variável categórica nos modelos de regressão. A interpretação continua a mesma, apenas devemos atentar para qual categoria da variável está descrita.
+
+Entre parêntese temos o erro padrão, para dar a informação de variabilidade - quanto menor, melhor.
+
+Ao fim da tabela, na segunda seção, temos algumas estatísticas:
+- número de observações;
+- R2: variabilidade capturada pelo modelo - quanto mais próximo de 1 melhor;
+- R2 ajustado: idem acima, apenas ajustado para o número de observações;
+- AIC: Akaike information criterion - quanto menor melhor;
+- BIC: Bayesian information criterion - quanto menor melhor;
+- Log.Lik.: quanto maior melhor
+
+Minha avaliação: valor da causa não ajudou o modelo, mas a faixa de valor da causa foi muito significativa; o termo de interação também foi positivo e muito significativo - nos processos que a agência é apelante e a decisão é provido, o tempo médio foi superior; diria que o melhor modelo é o 2 (todas as variáveis exceto valor da causa), devido ao maior R2 ajustado e menores AIC e BIC. Os modelos 1 e 5 também são bons.
+
+```{r}
+trf3 <- trfs %>% filter(tribunal == "TRF3")
+modelos <- list()
+modelos[["modelo1"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trf3)
+
+modelos[["modelo2"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + valor_faixa + decisao*agencia_apelante, 
+                           data = trf3)
+
+modelos[["modelo3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + valor_faixa + decisao*agencia_apelante, 
+                           data = trf3)
+
+modelos[["modelo4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + valor_faixa + decisao*agencia_apelante, 
+                           data = trf3)
+
+modelos[["modelo5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + valor_faixa + decisao*agencia_apelante, 
+                           data = trf3)
+
+modelos[["modelo6"]] <- lm(tempo_processo ~ agencia_apelante + valor_faixa + decisao*agencia_apelante, 
+                           data = trf3)
+
+msummary(modelos, stars = TRUE,  output = "html")
+msummary(modelos, stars = TRUE, "./results/lm_trf3.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+
+## TRF-1
+
+As mesmas observações de acima aplicam-se aqui.
+
+Tabela de frequência das agências:
+
+```{r}
+trfs %>% 
+  filter(tribunal == "TRF1") %>% 
+  count(agencia) %>% 
+  knitr::kable() %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+### Considerando as variáveis de valor da causa
+
+Avaliação: o melhor modelo é o 2 (todas as observações exceto o valor da causa), devido aos maiores valores de R2 e menores de AIC e BIC. Aqui o termo de interação não foi significativo em nenhum modelo. No entanto, o número de observações cai bastante, pois temos muitos NAs nas variáveis de valor da causa. Modelo 4 também foi bom.
+
+```{r}
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + valor_faixa + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + valor_faixa + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + valor_faixa + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["Model A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + valor_faixa + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + valor_faixa + decisao*agencia_apelante, 
+                           data = trf1)
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trf1_com-valor.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+### Desconsiderando as variáveis de valor da causa
+
+Minha avaliação: o melhor modelo é o 1 (todas as variáveis) ou 5 (sem tipologia), devido aos maiores valores de R2 e menores de AIC e BIC. Aqui o termo de interação não foi significativo em nenhum modelo.
+
+```{r}
+modelos <- list()
+modelos[["modelo1"]] <- lm(tempo_processo ~ agencia + assunto +  agencia_apelante + tipologia + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["modelo3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["modelo4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["modelo5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + decisao*agencia_apelante, 
+                           data = trf1)
+
+modelos[["modelo6"]] <- lm(tempo_processo ~ agencia_apelante + decisao*agencia_apelante, 
+                           data = trf1)
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trf1_sem-valor.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+## TRFs
+
+Vou juntar as bases dos TRFs e rodar os modelos, inserindo uma variável de qual TRF os dados provêm e retirando o valor da causa.
+
+Variável dependente: tempo de processo.
+
+Modelos testados:
+- modelo1: agência, assunto, agência apelante, tipologia, tribunal, valor da causa e agencia apelante[sim] x decisão[sim];
+- modelo2: agência, assunto, agência apelante, tipologia, tribunal, faixa de valor da causa e agencia apelante[sim] x decisão[sim];
+- modelo3: todas exceto valor da causa e agencia;
+- modelo4: todas exceto valor da causa e assunto;
+- modelo5: todas exceto valor da causa e tipologia;
+- modelo6: agência apelante, faixa de valor da causa, tribunal e agencia apelante[sim] x decisão[sim].
+
+### Considerando as variáveis de valor da causa
+
+Avaliação: modelos 2 e 5 parecem os melhores. Termo de interação é significativo e positivo (influência do TRF3); tipologia não parece influenciar muito; o tribunal ser o TRF3 influenciou negativamente no tempo do processo, mas é significativo apenas em 2 modelos (4 e 6); as faixas de valor são sempre significativas e positivas; mas estamos usando apenas parte dos dados do TRF1 (225/564).
+
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Models A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_completo.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+Acatando as sugestões do VIF, vou retirar algumas variáveis dos modelos
+
+```{r}
+
+modelos <- list()
+modelos[["Model A1"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + scale(valor_causa) + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A2"]] <- lm(tempo_processo ~ agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Models A5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["Model A6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + valor_faixa + decisao*agencia_apelante, 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_com-valor_ajustado.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+Ganhamos em rigor estatístico mas os modelos 1 e 2, que tirei as variáveis assunto e agência, perderam em explicação do modelo (R2 caiu bastante). Dessa forma, acho que podemos manter, por enquanto, a tabela anterior.
+
+### Desconsiderando as variáveis de valor da causa
+
+Avaliação: modelos 1 e 5 parecem os melhores. Termo de interação é significativo e positivo (influência do TRF3); tipologia não parece influenciar muito; o tribunal ser o TRF3 influenciou negativamente no tempo do processo, e é significativo em todos os modelos; e estamos utilizando todas as observações.
+
+```{r}
+
+modelos <- list()
+modelos[["modelo1"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tipologia + tribunal + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["modelo3"]] <- lm(tempo_processo ~ assunto + agencia_apelante + tipologia + tribunal + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["modelo4"]] <- lm(tempo_processo ~ agencia + agencia_apelante + tipologia + tribunal + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["modelo5"]] <- lm(tempo_processo ~ agencia + assunto + agencia_apelante + tribunal + decisao*agencia_apelante, 
+                           data = trfs)
+
+modelos[["modelo6"]] <- lm(tempo_processo ~ agencia_apelante + tribunal + decisao*agencia_apelante, 
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/lm_trfs_sem-valor.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+## Regressão logística
+
+Verica a distribuição da variável dependente:
+```{r}
+trfs %>% count(decisao)
+```
+
+Ok. O ideal seria 50%-50%.
+
+### Considerando as variáveis de valor da causa
+
+Interpretação dos resultados: os coeficientes obtidos são chamados de odds-ratio - não são probabilidade nem números simples, mas sim uma relação logarítimica entre as probabilidades. De forma simplificada: valores positivos indicam que aquela variável/categoria influenciam positivamente na decisão ser provida; valores negativos influenciam negativamente na probabilidade da decisão ser provida. Infelizmente poucos coeficientes foram estatisticamente significantes. A decisão foi codificada como 1 se provida, e 0 caso contrário.
+
+```{r}
+trfs <- trfs %>% 
+  mutate(decisao_d = ifelse(decisao == "provido",
+                          1,
+                          0))
+modelos <- list()
+modelos[["modelo1"]] <- glm(decisao_d ~ agencia + assunto + scale(tempo_processo) + agencia_apelante + tipologia + tribunal + scale(valor_causa), family = binomial,
+                           data = trfs)
+
+modelos[["modelo2"]] <- glm(decisao_d ~ agencia + assunto + scale(tempo_processo) + agencia_apelante + tipologia + tribunal + valor_faixa, family = binomial,
+                           data = trfs)
+
+modelos[["modelo3"]] <- glm(decisao_d ~ assunto + scale(tempo_processo) + agencia_apelante + tipologia + tribunal + valor_faixa, 
+                           family = binomial, data = trfs)
+
+modelos[["modelo4"]] <- glm(decisao_d ~ agencia + scale(tempo_processo) + agencia_apelante + tipologia + tribunal + valor_faixa, 
+                           family = binomial, data = trfs)
+
+modelos[["modelo5"]] <- glm(decisao_d ~ agencia + assunto + scale(tempo_processo) + agencia_apelante + tribunal + valor_faixa, 
+                           family = binomial, data = trfs)
+
+modelos[["modelo6"]] <- glm(decisao_d ~ scale(tempo_processo) + agencia_apelante + tribunal + valor_faixa, family = binomial,
+                           data = trfs)
+
+
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/logit_trfs_com-valor.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```
+
+### Desconsiderando as variáveis de valor da causa
+
+```{r}
+modelos <- list()
+modelos[["modelo1"]] <- glm(decisao_d ~ agencia + assunto + scale(tempo_processo) + agencia_apelante + tipologia + tribunal, family = binomial,
+                           data = trfs)
+
+modelos[["modelo2"]] <- glm(decisao_d ~ agencia + assunto + scale(tempo_processo) + agencia_apelante + tipologia + tribunal, family = binomial,
+                           data = trfs)
+
+modelos[["modelo3"]] <- glm(decisao_d ~ assunto + scale(tempo_processo) + agencia_apelante + tipologia + tribunal, 
+                           family = binomial, data = trfs)
+
+modelos[["modelo4"]] <- glm(decisao_d ~ agencia + scale(tempo_processo) + agencia_apelante + tipologia + tribunal, 
+                           family = binomial, data = trfs)
+
+modelos[["modelo5"]] <- glm(decisao_d ~ agencia + assunto + scale(tempo_processo) + agencia_apelante + tribunal, 
+                           family = binomial, data = trfs)
+
+modelos[["modelo6"]] <- glm(decisao_d ~ scale(tempo_processo) + agencia_apelante + tribunal, family = binomial,
+                           data = trfs)
+
+# predict <- plogis(predict(modelos[["modelo3"]], trfs))
+msummary(modelos, stars = TRUE, output = "html")
+msummary(modelos, stars = TRUE, output = "./results/logit_trfs_sem-valor.docx")
+```
+
+Verificação de multicolinearidade. VIF (variance inflation factors) deve estar abaixo de 4.
+```{r}
+modelos %>% map(car::vif)
+```

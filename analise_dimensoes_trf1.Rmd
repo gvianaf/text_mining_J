@@ -1,7 +1,7 @@
 ---
 title: "Análise das expressões"
 author: "GVF"
-date: "24/07/2020"
+date: "`r format(Sys.time(), '%d/%m/%Y')`"
 output: html_document
 params:
   printcode: FALSE
@@ -126,6 +126,8 @@ correspondencias <- trf1_limpo %>%
 correspondencias$termo %>% 
   unlist() %>% 
   enframe() %>% 
+  # retiro os termos que não devem fazer parte da análise
+  filter(!str_detect(value, "uniao|juizo|supremo|secao|ocasiao|desta|nesse|reconhece|territorial|tributar|apreciacao")) %>% 
   count(value, sort = TRUE) %>% 
   head(50) %>% 
   kable() %>% 

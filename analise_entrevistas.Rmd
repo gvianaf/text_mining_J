@@ -1,0 +1,201 @@
+---
+title: "Entrevistas"
+author: "GVF"
+date: "`r format(Sys.time(), '%d/%m/%Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
+                      fig.retina = 5, dev = 'svg', fig.align = 'center')
+
+options(OutDec = ",", scipen = 9)
+
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(knitr)
+library(kableExtra)
+library(ggwordcloud)
+library(showtext)
+
+showtext_auto()
+font_add("charter", "C:/Users/GUILHERME/AppData/Local/Microsoft/Windows/Fonts/Charter Regular.otf")
+
+entrevistas <- rio::import("entrevistas.xlsx")
+```
+
+<style type="text/css">
+
+body {
+
+  font-family: Charter;
+
+}
+
+</style>
+
+# Análise do *corpus* das entrevistas realizadas pelo pequisador
+
+## Estatísticas gerais
+
+Quantas palavras cada entrevistado disse? E a média por grupo? Sem filtrar nada.
+
+```{r}
+palavras <- 
+  entrevistas %>% 
+  group_by(entrevistado) %>% 
+  unnest_tokens(word, corpus) %>% 
+  ungroup() %>% 
+  mutate(categoria = case_when(
+    
+    str_detect(entrevistado, "tec")  ~ "tec",
+    str_detect(entrevistado, "proc") ~ "proc",
+    str_detect(entrevistado, "juiz") ~ "juiz"
+    
+  ))
+
+palavras %>% 
+  count(entrevistado, sort = TRUE) %>% 
+  kable(caption = "Total de palavras transcritas",
+        format.args = list(big.mark = ".")) %>% 
+  kable_styling(full_width = FALSE)
+
+palavras %>% 
+  count(categoria, sort = TRUE) %>% 
+  kable(caption = "Total de palavras transcritas por categoria",
+        format.args = list(big.mark = ".")) %>% 
+  kable_styling(full_width = FALSE)
+
+palavras %>% 
+  count(entrevistado, categoria) %>% 
+  group_by(categoria) %>% 
+  summarise(média = mean(n)) %>% 
+  kable(caption = "Média de palavras transcritas por entrevistado da categoria", 
+        digits = 0,
+        format.args = list(big.mark = ".")) %>% 
+  kable_styling(full_width = FALSE)
+```
+
+## Frequência dos termos
+
+A estatística tf-idf (term frequency - inverse document frequency) é uma medida de **originalidade** de uma dada palavra, e é obtida pela comparação de quantas vezes essa palavra aparece dentro do contexto do documento analisado. Palavras comuns (que, a, o, de) têm tf-idf baixa, enquanto que palavras mais raras, no contexto, têm tf-idf alta. Aqui vou analisar essa estística dentro de cada categoria: juiz, proc e tec.
+
+```{r graf-tf-idf, fig.height=7, fig.width=10}
+totais <- palavras %>% 
+  count(categoria, name = "total")
+
+palavras <- 
+  palavras %>% 
+  group_by(categoria) %>% 
+  count(word, sort = TRUE) %>% 
+  left_join(totais) %>% 
+  bind_tf_idf(word, categoria, n)
+
+palavras %>% 
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  group_by(categoria) %>% 
+  top_n(20) %>% 
+  ungroup() %>%
+  ggplot(aes(word, tf_idf, fill = categoria)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~categoria, ncol = 3, scales = "free") +
+  coord_flip() +
+  theme_minimal(base_family = "charter") +
+  scale_fill_viridis_d() +
+  labs(title = "As 20 palavras mais importantes em cada entrevista, por categoria, de acordo com a estatística tf-idf")
+
+```
+
+## Nuvem de palavras
+
+Primeiramente vou fazer uma limpeza no texto.
+
+```{r}
+remover_br <- tibble(word = stopwords("pt"))
+remover_letras <- tibble(word = letters)
+remover_outros <- tibble(word = c("ai", "ja", "so", "assim", "ate", "la", "ha"))
+
+texto_entrevista <- 
+  entrevistas %>% 
+  # Jeovan pediu para deixar junto
+  mutate(corpus = str_replace_all(corpus, 
+                                   regex("energia el(é|e)trica", ignore_case = TRUE), 
+                                   "energiaeletrica"),
+         corpus = str_replace_all(corpus, 
+                                   regex("vigil(â|a)ncia sanit(á|a)ria", ignore_case = TRUE), 
+                                   "vigilanciasanitaria"),
+         corpus = str_remove_all(corpus,
+                                  regex("mandado de seguran(ç|c)a", ignore_case = TRUE))) %>% 
+  # quebra o corpus por palavra
+  unnest_tokens(word, corpus) %>% 
+  # tira os acentos e caracteres especiais
+  mutate(word = stringi::stri_trans_general(word, "latin-ascii")) %>% 
+  # tira as palavras comuns
+  anti_join(remover_br) %>% 
+  # tira as letras soltas
+  anti_join(remover_letras) %>% 
+  # tira outras palavras não relevantes
+  anti_join(remover_outros) %>%
+  # mantém apenas texto
+  filter(str_detect(word, "\\D"), 
+         # exclui os ordinais 
+         !str_detect(word, "\\d(ª|º)"),
+         # exclui numerais romanos
+         !str_detect(word, "^[mdclxvi]+$"))
+
+palavras_entrevista <- 
+  texto_entrevista %>% 
+  count(word, sort = TRUE)
+```
+
+As 50 palavras simples mais frequentes:
+```{r}
+palavras_entrevista %>% 
+  head(50) %>% 
+  kable() %>% 
+  kable_styling(full_width = FALSE)
+```
+
+Nuvem de palavras (50 palavras mais comuns):
+```{r nuvem-geral}
+palavras_entrevista %>% 
+  head(50) %>% 
+  ggplot(aes(label = word, size = n, color = n)) +
+  geom_text_wordcloud(area_corr = TRUE, family = "charter", show.legend = TRUE) +
+  scale_size_area(max_size = 16) +
+  theme_minimal(base_family = "charter") +
+  scale_color_viridis_c() +
+  labs(title = "As 50 palavras mais frequentes nas entrevistas",
+       subtitle = "Considerando as três categorias",
+       caption = "Fonte: elaboração própria")
+```
+
+Nuvem de palavras (50 palavras mais comuns), por categoria:
+```{r nuvem-categoria, fig.height=7}
+texto_entrevista %>% 
+  mutate(categoria = case_when(
+    
+    str_detect(entrevistado, "tec")  ~ "tec",
+    str_detect(entrevistado, "proc") ~ "proc",
+    str_detect(entrevistado, "juiz") ~ "juiz"
+    
+  )) %>% 
+  group_by(categoria) %>% 
+  count(word, sort = TRUE) %>% 
+  slice(1:50) %>% 
+  ggplot(aes(label = word, size = n, color = n)) +
+  geom_text_wordcloud(area_corr = TRUE, family = "charter", show.legend = TRUE) +
+  scale_size_area(max_size = 14) +
+  facet_wrap(~categoria, ncol = 1) + 
+  theme_minimal(base_family = "charter") +
+  scale_color_viridis_c() +
+  labs(title = "As 50 palavras mais frequentes nas entrevistas",
+       subtitle = "Em cada uma das três categorias",
+       caption = "Fonte: elaboração própria")
+```
+
+***
+Foram desconsideradas `r nrow(remover_outros)` palavras/termos na análise, que são as seguintes: `r remover_outros %>% deframe() %>%  knitr::combine_words(and = "e ")`.

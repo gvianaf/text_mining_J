@@ -1,13 +1,13 @@
 ---
 title: "Análise das dimensões - TRF3"
 author: "GVF"
-date: "24/07/2020"
+date: "`r format(Sys.time(), '%d/%m/%Y')`"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE,
-                      fig.retina = 4, dev = 'svg', fig.align = 'center')
+                      fig.retina = 5, dev = 'svg', fig.align = 'center')
 
 options(OutDec = ",")
 
@@ -22,16 +22,11 @@ library(showtext)
 showtext_auto()
 font_add("charter", "C:/Users/GUILHERME/AppData/Local/Microsoft/Windows/Fonts/Charter Regular.otf")
 
-trf3 <- rio::import("julgados-trf3.csv", encoding = "UTF-8") %>% 
-  mutate(processo = as.double(processo)) %>% 
-  janitor::get_dupes(processo)
-  # retirar a ANA
-  filter(!str_detect(processo, regex( "AGENCIA NACIONAL DE AGUAS", ignore_case = TRUE))) %>% 
-  distinct(processo, .keep_all = TRUE)
+trf3 <- read.csv("julgados-trf3.csv", encoding = "UTF-8") %>% 
+  distinct(processo, .keep_all = TRUE) %>% 
+  mutate(processo = as.double(processo))
 
-rm(retirar)
-
-# trf3 <- rio::import("julgados-trf3.csv", encoding = "UTF-8")
+rio::export(trf3, "julgados-trf3-unicos.csv")
 
 ```
 
