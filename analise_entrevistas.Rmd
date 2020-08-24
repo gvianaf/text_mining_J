@@ -1,7 +1,7 @@
 ---
 title: "Entrevistas"
 author: "GVF"
-date: "`r format(Sys.time(), '%d/%m/%Y')`"
+date: "última atualização: `r format(Sys.time(), '%d/%m/%Y')`"
 output: html_document
 ---
 
@@ -116,7 +116,9 @@ Primeiramente vou fazer uma limpeza no texto.
 ```{r}
 remover_br <- tibble(word = stopwords("pt"))
 remover_letras <- tibble(word = letters)
-remover_outros <- tibble(word = c("ai", "ja", "so", "assim", "ate", "la", "ha"))
+remover_outros <- tibble(word = c("ai", "ja", "so", "assim", "ate", "la", "ha", "nao", "gente", "entao", "voce", "acho",
+                                  "porque", "tambem", "ser", "vezes", "vai", "sao", "ter", "exemplo", "bem", "muitas",
+                                  "sobre", "todo", "tudo", "ponto", "ainda", "aqui"))
 
 texto_entrevista <- 
   entrevistas %>% 
@@ -174,7 +176,7 @@ palavras_entrevista %>%
 ```
 
 Nuvem de palavras (50 palavras mais comuns), por categoria:
-```{r nuvem-categoria, fig.height=7}
+```{r nuvem-categoria, fig.height=10}
 texto_entrevista %>% 
   mutate(categoria = case_when(
     
